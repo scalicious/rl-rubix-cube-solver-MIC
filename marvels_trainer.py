@@ -1,33 +1,13 @@
 """
-marvels_trainer.py — Full PPO Training Loop for MARVELS
-========================================================
-Orchestrates the multi-agent training pipeline:
+marvels_trainer.py - PPO training loop for the multi-agent system.
 
-  1. Collect rollouts from vectorized environments
-  2. Compute rewards = external + 0.5 × curiosity
-  3. Calculate GAE advantages
-  4. PPO update for each agent + skill composer
-  5. Curriculum: increase scramble depth on success
-
-Training Flow (per iteration):
-  ┌─────────────────────────────────────────────────┐
-  │  For each env step:                              │
-  │    state → encoder → 270-d                       │
-  │    270-d → each agent → 3 policies               │
-  │    3 policies + state → composer → final policy   │
-  │    sample action → env.step()                    │
-  │    compute curiosity rewards                     │
-  │    store transition                               │
-  │  End rollout                                     │
-  │                                                  │
-  │  Compute GAE advantages                          │
-  │  PPO update (clip=0.2, entropy=0.01, epochs=4)   │
-  │  Update curriculum                               │
-  └─────────────────────────────────────────────────┘
+Handles rollout collection, GAE advantage computation, PPO updates
+for all agents + skill composer, and curriculum learning.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 from typing import Dict, List, Tuple, Optional
@@ -44,17 +24,8 @@ from utils import (
 )
 
 
-# ──────────────────── Rollout Buffer ────────────────────
-
 class RolloutBuffer:
-    """
-    Stores transitions from rollout collection for PPO updates.
-
-    Stores per-step:
-      - states (encoded), actions, log_probs, rewards, values, dones
-      - curiosity rewards per agent
-      - Agent-specific data for individual agent updates
-    """
+    """Stores transitions from one rollout for PPO."""
 
     def __init__(self):
         self.states = []
@@ -64,12 +35,8 @@ class RolloutBuffer:
         self.values = []
         self.dones = []
         self.curiosity_rewards = []
-
-        # Per-agent data
         self.agent_log_probs = [[], [], []]
         self.agent_values = [[], [], []]
-
-        # Next states for curiosity computation
         self.next_states = []
 
     def add(self, state, action, log_prob, reward, value, done,
@@ -94,40 +61,22 @@ class RolloutBuffer:
         return len(self.states)
 
 
-# ──────────────── GAE Computation ────────────────
-
-def compute_gae(rewards: List[float], values: List[float],
-                dones: List[bool], next_value: float,
-                gamma: float = 0.999, lam: float = 0.95) -> Tuple[List[float], List[float]]:
+def compute_gae(rewards, values, dones, next_value, gamma=0.999, lam=0.95):
     """
-    Generalized Advantage Estimation (GAE-λ).
-
-    Args:
-        rewards: list of rewards per step
-        values: list of value estimates per step
-        dones: list of done flags per step
-        next_value: value estimate of the state after the last step
-        gamma: discount factor (high because cube reward is sparse)
-        lam: GAE lambda (bias-variance tradeoff)
-
-    Returns:
-        advantages: list of GAE advantages
-        returns: list of discounted returns (advantages + values)
+    GAE-lambda advantage estimation.
+    High gamma because cube reward is very sparse.
+    Returns (advantages, returns).
     """
     advantages = []
     gae = 0.0
 
-    # Work backwards through the trajectory
     for t in reversed(range(len(rewards))):
         if t == len(rewards) - 1:
             next_val = next_value
         else:
             next_val = values[t + 1]
 
-        # Mask: if done, next value is 0
         mask = 0.0 if dones[t] else 1.0
-
-        # TD error
         delta = rewards[t] + gamma * next_val * mask - values[t]
         gae = delta + gamma * lam * mask * gae
         advantages.insert(0, gae)
@@ -136,41 +85,31 @@ def compute_gae(rewards: List[float], values: List[float],
     return advantages, returns
 
 
-# ──────────────── MARVELS Trainer ────────────────
-
 class MARVELSTrainer:
     """
-    Main training class for the MARVELS algorithm.
-
-    Manages:
-      - 3 specialized agents (corner, edge, center)
-      - Skill composer (attention-based blending)
-      - Quaternion encoder
-      - PPO optimization
-      - Curriculum learning
-      - Checkpointing and logging
+    Main trainer — manages agents, composer, encoder, PPO optimization,
+    curriculum scheduling, and checkpointing.
     """
 
-    def __init__(self, config: Optional[Dict] = None):
-        # ──── Configuration ────
+    def __init__(self, config=None):
         self.config = {
-            'num_envs': 16,               # Parallel environments
-            'rollout_length': 128,         # Steps per rollout
-            'ppo_epochs': 4,               # PPO update epochs
-            'mini_batch_size': 64,         # Mini-batch size
-            'clip_ratio': 0.2,             # PPO clip parameter
-            'entropy_coef': 0.01,          # Entropy bonus coefficient
-            'value_coef': 0.5,             # Value loss coefficient
-            'curiosity_coef': 0.5,         # Curiosity reward scaling
-            'max_grad_norm': 0.5,          # Gradient clipping
-            'lr': 3e-4,                    # Learning rate
-            'gamma': 0.999,               # Discount factor
-            'gae_lambda': 0.95,           # GAE lambda
-            'curiosity_lr': 1e-3,         # Curiosity module LR
-            'initial_scramble_depth': 1,  # Curriculum start
-            'max_scramble_depth': 25,     # Curriculum max
-            'curriculum_threshold': 0.5,  # Success rate to advance
-            'max_moves': 200,             # Episode max length
+            'num_envs': 16,
+            'rollout_length': 128,
+            'ppo_epochs': 4,
+            'mini_batch_size': 64,
+            'clip_ratio': 0.2,
+            'entropy_coef': 0.01,
+            'value_coef': 0.5,
+            'curiosity_coef': 0.5,
+            'max_grad_norm': 0.5,
+            'lr': 3e-4,
+            'gamma': 0.999,
+            'gae_lambda': 0.95,
+            'curiosity_lr': 1e-3,
+            'initial_scramble_depth': 1,
+            'max_scramble_depth': 25,
+            'curriculum_threshold': 0.5,
+            'max_moves': 200,
             'device': 'cpu',
             'save_dir': './checkpoints',
         }
@@ -179,7 +118,7 @@ class MARVELSTrainer:
 
         self.device = torch.device(self.config['device'])
 
-        # ──── Initialize Components ────
+        # models
         self.encoder = QuaternionEncoder().to(self.device)
         self.agents = [
             CornerAgent(270, NUM_ACTIONS).to(self.device),
@@ -188,17 +127,14 @@ class MARVELSTrainer:
         ]
         self.composer = SkillComposer(270, 3).to(self.device)
 
-        # ──── Optimizers ────
-        # Single optimizer for all components (joint training)
-        all_params = []
-        all_params += list(self.encoder.parameters())
+        # joint optimizer for everything except curiosity
+        all_params = list(self.encoder.parameters())
         for agent in self.agents:
             all_params += list(agent.parameters())
         all_params += list(self.composer.parameters())
-
         self.optimizer = optim.Adam(all_params, lr=self.config['lr'], eps=1e-5)
 
-        # Separate optimizer for curiosity modules (different learning rate)
+        # separate optimizer for curiosity modules (higher lr)
         curiosity_params = []
         for agent in self.agents:
             curiosity_params += list(agent.curiosity.parameters())
@@ -206,13 +142,13 @@ class MARVELSTrainer:
             curiosity_params, lr=self.config['curiosity_lr'], eps=1e-5
         )
 
-        # ──── Environments ────
+        # environments
         self.vec_env = VectorizedRubiksCube(
             self.config['num_envs'],
             max_moves=self.config['max_moves']
         )
 
-        # ──── Tracking ────
+        # tracking
         self.current_scramble_depth = self.config['initial_scramble_depth']
         self.total_steps = 0
         self.total_episodes = 0
@@ -221,37 +157,18 @@ class MARVELSTrainer:
         self.reward_history = deque(maxlen=100)
         self.move_count_history = deque(maxlen=100)
 
-    def _encode_states(self, states: List[dict]) -> torch.Tensor:
-        """Encode a list of state dicts into a batch tensor."""
+    def _encode_states(self, states):
         return self.encoder.encode_and_project(states, self.device)
 
-    # ──────────────── Rollout Collection ────────────────
-
-    def collect_rollout(self) -> RolloutBuffer:
-        """
-        Collect a full rollout from all parallel environments.
-
-        For each step:
-          1. Encode state via quaternion encoder
-          2. Get individual agent policies
-          3. Compose final policy via skill composer
-          4. Sample action, step environment
-          5. Compute curiosity rewards
-          6. Store transition
-
-        Returns filled RolloutBuffer.
-        """
+    def collect_rollout(self):
+        """Collect one full rollout from all parallel envs."""
         buffer = RolloutBuffer()
-
-        # Reset all envs with current scramble depth
         states = self.vec_env.reset_all(self.current_scramble_depth)
 
         for step in range(self.config['rollout_length']):
             with torch.no_grad():
-                # Encode current states
                 state_tensor = self._encode_states(states)
 
-                # Get individual agent policies and values
                 agent_policies = []
                 agent_log_probs_list = []
                 agent_values_list = []
@@ -262,20 +179,17 @@ class MARVELSTrainer:
                     agent_policies.append(policy)
                     agent_values_list.append(value.squeeze(-1))
 
-                # Compose final policy
                 final_policy = self.composer(state_tensor, agent_policies)
                 meta_value = self.composer.get_value(state_tensor)
 
-                # Sample actions (one per env)
                 dist = torch.distributions.Categorical(final_policy)
                 actions = dist.sample()
                 log_probs = dist.log_prob(actions)
 
-            # Step all environments
             actions_list = actions.cpu().numpy().tolist()
             next_states, rewards, dones, infos = self.vec_env.step(actions_list)
 
-            # Compute curiosity rewards
+            # curiosity rewards
             with torch.no_grad():
                 next_state_tensor = self._encode_states(next_states)
                 total_curiosity = torch.zeros(self.config['num_envs'], device=self.device)
@@ -286,16 +200,14 @@ class MARVELSTrainer:
                     )
                     total_curiosity += curiosity_r
 
-                # Average curiosity across agents
                 avg_curiosity = total_curiosity / len(self.agents)
 
-            # Compute total reward per env
+            # store transitions
             for env_idx in range(self.config['num_envs']):
                 ext_reward = rewards[env_idx]
                 cur_reward = avg_curiosity[env_idx].item()
                 total_reward = ext_reward + self.config['curiosity_coef'] * cur_reward
 
-                # Store per-agent log probs and values
                 per_agent_lp = [alp[env_idx].item() for alp in agent_log_probs_list] if agent_log_probs_list else [0.0, 0.0, 0.0]
                 per_agent_v = [av[env_idx].item() for av in agent_values_list]
 
@@ -312,14 +224,13 @@ class MARVELSTrainer:
                     next_state=next_state_tensor[env_idx].cpu().numpy(),
                 )
 
-                # Track episode completion
                 if dones[env_idx]:
                     self.total_episodes += 1
                     self.solve_history.append(infos[env_idx]['solved'])
                     self.reward_history.append(ext_reward)
                     self.move_count_history.append(infos[env_idx]['move_count'])
 
-            # Reset done environments
+            # reset finished envs
             for env_idx in range(self.config['num_envs']):
                 if dones[env_idx]:
                     next_states[env_idx] = self.vec_env.reset_one(
@@ -331,24 +242,8 @@ class MARVELSTrainer:
 
         return buffer
 
-    # ──────────────── PPO Update ────────────────
-
-    def update(self, buffer: RolloutBuffer) -> Dict[str, float]:
-        """
-        Perform PPO update on all components using collected rollout data.
-
-        Steps:
-          1. Compute GAE advantages
-          2. For each PPO epoch, shuffle data into mini-batches
-          3. Compute policy loss (clipped surrogate)
-          4. Compute value loss
-          5. Compute entropy bonus
-          6. Compute curiosity losses (forward + inverse)
-          7. Backprop through all components jointly
-
-        Returns dict of loss metrics.
-        """
-        # ──── Prepare data ────
+    def update(self, buffer):
+        """PPO update on all components using collected rollout."""
         states_np = np.array(buffer.states)
         next_states_np = np.array(buffer.next_states)
         actions_np = np.array(buffer.actions)
@@ -357,18 +252,15 @@ class MARVELSTrainer:
         values_list = buffer.values
         dones_list = buffer.dones
 
-        # Compute last value for GAE
         with torch.no_grad():
             last_state = torch.FloatTensor(states_np[-1:]).to(self.device)
             last_value = self.composer.get_value(last_state).item()
 
-        # Compute GAE
         advantages, returns = compute_gae(
             rewards_list, values_list, dones_list, last_value,
             gamma=self.config['gamma'], lam=self.config['gae_lambda']
         )
 
-        # Convert to tensors
         states_t = torch.FloatTensor(states_np).to(self.device)
         next_states_t = torch.FloatTensor(next_states_np).to(self.device)
         actions_t = torch.LongTensor(actions_np).to(self.device)
@@ -376,10 +268,9 @@ class MARVELSTrainer:
         advantages_t = torch.FloatTensor(advantages).to(self.device)
         returns_t = torch.FloatTensor(returns).to(self.device)
 
-        # Normalize advantages
+        # normalize advantages
         advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
 
-        # ──── PPO Epochs ────
         num_samples = len(buffer)
         batch_size = self.config['mini_batch_size']
         metrics = {
@@ -392,7 +283,6 @@ class MARVELSTrainer:
         num_updates = 0
 
         for epoch in range(self.config['ppo_epochs']):
-            # Shuffle indices
             indices = np.random.permutation(num_samples)
 
             for start in range(0, num_samples, batch_size):
@@ -406,39 +296,36 @@ class MARVELSTrainer:
                 b_advantages = advantages_t[batch_idx]
                 b_returns = returns_t[batch_idx]
 
-                # ──── Forward pass through all agents ────
+                # forward through agents
                 agent_policies = []
                 agent_entropies = []
 
                 for agent in self.agents:
                     policy = agent.get_policy(b_states)
                     agent_policies.append(policy)
-
-                    # Agent entropy for exploration
                     dist = torch.distributions.Categorical(policy)
                     agent_entropies.append(dist.entropy().mean())
 
-                # ──── Forward pass through composer ────
+                # forward through composer
                 log_probs, values, entropy = self.composer.evaluate_composed(
                     b_states, agent_policies, b_actions
                 )
 
-                # ──── Policy loss (clipped surrogate) ────
+                # clipped surrogate loss
                 ratio = torch.exp(log_probs - b_old_log_probs)
                 surr1 = ratio * b_advantages
                 surr2 = torch.clamp(ratio, 1 - self.config['clip_ratio'],
                                     1 + self.config['clip_ratio']) * b_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # ──── Value loss ────
                 value_loss = F.mse_loss(values, b_returns)
 
-                # ──── Entropy bonus ────
+                # entropy bonus (individual agents get smaller weight)
                 total_entropy = entropy.mean()
                 for ae in agent_entropies:
-                    total_entropy += ae * 0.1  # Smaller weight for individual agents
+                    total_entropy += ae * 0.1
 
-                # ──── Curiosity losses ────
+                # curiosity losses
                 total_forward_loss = torch.tensor(0.0, device=self.device)
                 total_inverse_loss = torch.tensor(0.0, device=self.device)
 
@@ -451,14 +338,13 @@ class MARVELSTrainer:
 
                 curiosity_loss = (total_forward_loss + total_inverse_loss) / len(self.agents)
 
-                # ──── Total loss ────
                 total_loss = (
                     policy_loss
                     + self.config['value_coef'] * value_loss
                     - self.config['entropy_coef'] * total_entropy
                 )
 
-                # ──── Update main parameters ────
+                # update main params
                 self.optimizer.zero_grad()
                 total_loss.backward()
                 nn.utils.clip_grad_norm_(
@@ -466,12 +352,11 @@ class MARVELSTrainer:
                 )
                 self.optimizer.step()
 
-                # ──── Update curiosity modules separately ────
+                # update curiosity separately
                 self.curiosity_optimizer.zero_grad()
                 curiosity_loss.backward()
                 self.curiosity_optimizer.step()
 
-                # Track metrics
                 metrics['policy_loss'] += policy_loss.item()
                 metrics['value_loss'] += value_loss.item()
                 metrics['entropy'] += total_entropy.item()
@@ -479,27 +364,20 @@ class MARVELSTrainer:
                 metrics['total_loss'] += total_loss.item()
                 num_updates += 1
 
-        # Average metrics
         for k in metrics:
             metrics[k] /= max(num_updates, 1)
 
         return metrics
 
     def _all_params(self):
-        """Get all trainable parameters for gradient clipping."""
         params = list(self.encoder.parameters())
         for agent in self.agents:
             params += list(agent.actor_critic.parameters())
         params += list(self.composer.parameters())
         return params
 
-    # ──────────────── Curriculum ────────────────
-
     def update_curriculum(self):
-        """
-        Increase scramble depth when solve rate exceeds threshold.
-        This implements curriculum learning: start easy, get harder.
-        """
+        """Bump scramble depth when we're solving consistently."""
         if len(self.solve_history) < 20:
             return
 
@@ -509,28 +387,12 @@ class MARVELSTrainer:
                 self.current_scramble_depth < self.config['max_scramble_depth']):
             self.current_scramble_depth += 1
             self.solve_history.clear()
-            print(f"  📈 Curriculum advanced → scramble depth = {self.current_scramble_depth}")
+            print(f"  Curriculum advanced -> scramble depth = {self.current_scramble_depth}")
 
-    # ──────────────── Training Loop ────────────────
-
-    def train(self, num_iterations: int = 1000,
-              log_interval: int = 10,
-              save_interval: int = 50) -> Dict:
-        """
-        Main training loop.
-
-        Args:
-            num_iterations: number of rollout + update cycles
-            log_interval: print stats every N iterations
-            save_interval: save checkpoint every N iterations
-
-        Returns:
-            dict with training history
-        """
+    def train(self, num_iterations=1000, log_interval=10, save_interval=50):
+        """Main training loop."""
         print("=" * 60)
         print("  MARVELS Training")
-        print("  Multi-Agent Residual Vision-Enhanced Learning")
-        print("  for Symbolic Reasoning")
         print("=" * 60)
         print(f"  Device:          {self.device}")
         print(f"  Num envs:        {self.config['num_envs']}")
@@ -553,16 +415,11 @@ class MARVELSTrainer:
         for iteration in range(1, num_iterations + 1):
             iter_start = time.time()
 
-            # ──── Collect rollout ────
             buffer = self.collect_rollout()
-
-            # ──── PPO update ────
             metrics = self.update(buffer)
-
-            # ──── Update curriculum ────
             self.update_curriculum()
 
-            # ──── Logging ────
+            # logging
             solve_rate = (sum(self.solve_history) / len(self.solve_history)
                           if self.solve_history else 0.0)
             avg_reward = (sum(self.reward_history) / len(self.reward_history)
@@ -578,29 +435,27 @@ class MARVELSTrainer:
 
             if iteration % log_interval == 0:
                 elapsed = time.time() - start_time
-                iter_time = time.time() - iter_start
                 steps_per_sec = self.total_steps / elapsed
 
-                print(f"  Iter {iteration:5d}/{num_iterations} │ "
-                      f"Scramble: {self.current_scramble_depth:2d} │ "
-                      f"Solve: {solve_rate:.1%} │ "
-                      f"Reward: {avg_reward:+7.2f} │ "
-                      f"Moves: {avg_moves:5.1f} │ "
-                      f"Loss: {metrics['total_loss']:.4f} │ "
-                      f"Curiosity: {metrics['curiosity_loss']:.4f} │ "
-                      f"Entropy: {metrics['entropy']:.3f} │ "
-                      f"{steps_per_sec:.0f} steps/s │ "
+                print(f"  Iter {iteration:5d}/{num_iterations} | "
+                      f"Scramble: {self.current_scramble_depth:2d} | "
+                      f"Solve: {solve_rate:.1%} | "
+                      f"Reward: {avg_reward:+7.2f} | "
+                      f"Moves: {avg_moves:5.1f} | "
+                      f"Loss: {metrics['total_loss']:.4f} | "
+                      f"Curiosity: {metrics['curiosity_loss']:.4f} | "
+                      f"Entropy: {metrics['entropy']:.3f} | "
+                      f"{steps_per_sec:.0f} steps/s | "
                       f"{format_time(elapsed)}")
 
-            # ──── Save checkpoint ────
             if iteration % save_interval == 0:
                 self._save(f"checkpoint_iter_{iteration}")
 
-            # Save best model
+            # save best
             if solve_rate > self.best_solve_rate and len(self.solve_history) >= 20:
                 self.best_solve_rate = solve_rate
                 self._save("best_model")
-                print(f"  ⭐ New best solve rate: {solve_rate:.1%}")
+                print(f"  New best solve rate: {solve_rate:.1%}")
 
         total_time = time.time() - start_time
         print()
@@ -614,22 +469,10 @@ class MARVELSTrainer:
 
         return history
 
-    # ──────────────── Solve Demo ────────────────
-
-    def solve(self, scramble_depth: int = 15,
-              max_moves: int = 200,
-              verbose: bool = True) -> Tuple[bool, int, List[str]]:
+    def solve(self, scramble_depth=15, max_moves=200, verbose=True):
         """
-        Attempt to solve a scrambled cube using the trained policy.
-        No search — pure policy inference.
-
-        Args:
-            scramble_depth: number of random moves to scramble
-            max_moves: maximum solve attempts
-            verbose: print step-by-step progress
-
-        Returns:
-            (solved, num_moves, move_list)
+        Try to solve a scrambled cube with the current policy.
+        No search — just greedy action selection.
         """
         env = RubiksCube()
         scramble_actions = env.scramble(scramble_depth)
@@ -649,46 +492,40 @@ class MARVELSTrainer:
             with torch.no_grad():
                 state_tensor = self._encode_states([state])
 
-                # Get agent policies
                 agent_policies = [
                     agent.get_policy(state_tensor)
                     for agent in self.agents
                 ]
 
-                # Compose and get weights
                 weights = self.composer.compute_weights(state_tensor)
                 final_policy = self.composer(state_tensor, agent_policies)
 
-                # Deterministic action selection
                 action = torch.argmax(final_policy, dim=-1).item()
 
             _, reward, done, info = env.step(action)
             move_list.append(ACTION_NAMES[action])
 
-            if verbose and step < 50:  # Print first 50 moves
+            if verbose and step < 50:
                 w = weights[0].cpu().numpy()
-                print(f"    Step {step+1:3d}: {ACTION_NAMES[action]:8s} │ "
+                print(f"    Step {step+1:3d}: {ACTION_NAMES[action]:8s} | "
                       f"Weights: C={w[0]:.2f} E={w[1]:.2f} O={w[2]:.2f}")
 
             if info['solved']:
                 if verbose:
-                    print(f"\n  🎉 SOLVED in {step+1} moves!")
+                    print(f"\n  SOLVED in {step+1} moves!")
                     print(f"\n  Final state:")
                     print(env.render())
-                    print(f"\n  Solution: {' → '.join(move_list)}")
+                    print(f"\n  Solution: {' -> '.join(move_list)}")
                 return True, step + 1, move_list
 
         if verbose:
-            print(f"\n  ❌ Failed to solve in {max_moves} moves")
+            print(f"\n  Failed to solve in {max_moves} moves")
             print(f"\n  Final state:")
             print(env.render())
 
         return False, max_moves, move_list
 
-    # ──────────────── Checkpointing ────────────────
-
-    def _save(self, name: str):
-        """Save all model parameters."""
+    def _save(self, name):
         save_checkpoint(
             path=f"{self.config['save_dir']}/{name}.pt",
             encoder=self.encoder,
@@ -705,8 +542,7 @@ class MARVELSTrainer:
             }
         )
 
-    def load(self, path: str):
-        """Load all model parameters from checkpoint."""
+    def load(self, path):
         stats = load_checkpoint(
             path=path,
             encoder=self.encoder,
@@ -726,7 +562,3 @@ class MARVELSTrainer:
         print(f"    Steps: {self.total_steps:,}, Episodes: {self.total_episodes:,}")
         print(f"    Best solve rate: {self.best_solve_rate:.1%}")
         print(f"    Scramble depth: {self.current_scramble_depth}")
-
-
-# Need F for mse_loss
-import torch.nn.functional as F

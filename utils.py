@@ -1,7 +1,5 @@
 """
-utils.py — Utility Functions for MARVELS
-==========================================
-Helpers for logging, checkpointing, visualization, and metrics tracking.
+utils.py - Checkpointing, logging, visualization, and misc helpers.
 """
 
 import torch
@@ -13,57 +11,40 @@ from typing import Dict, List, Optional, Any
 from collections import deque
 
 
-# ──────────────── Moving Average Tracker ────────────────
-
 class MovingAverage:
-    """
-    Exponential moving average tracker for metrics.
-    Useful for smoothing noisy training signals.
-    """
+    """Simple windowed average for tracking metrics."""
 
-    def __init__(self, window: int = 100):
+    def __init__(self, window=100):
         self.window = window
         self.values = deque(maxlen=window)
 
-    def add(self, value: float):
+    def add(self, value):
         self.values.append(value)
 
     @property
-    def mean(self) -> float:
+    def mean(self):
         if not self.values:
             return 0.0
         return sum(self.values) / len(self.values)
 
     @property
-    def std(self) -> float:
+    def std(self):
         if len(self.values) < 2:
             return 0.0
         m = self.mean
         return (sum((v - m) ** 2 for v in self.values) / len(self.values)) ** 0.5
 
     @property
-    def count(self) -> int:
+    def count(self):
         return len(self.values)
 
     def __repr__(self):
         return f"MovingAverage(mean={self.mean:.4f}, n={self.count})"
 
 
-# ──────────────── Checkpointing ────────────────
-
-def save_checkpoint(path: str, encoder, agents, composer,
-                    optimizer, curiosity_optimizer,
-                    config: Dict, stats: Dict):
-    """
-    Save all model parameters and training state to a file.
-
-    Saves:
-      - Encoder state dict
-      - Each agent's state dict (actor-critic + curiosity)
-      - Skill composer state dict
-      - Optimizer states
-      - Config and training stats
-    """
+def save_checkpoint(path, encoder, agents, composer,
+                    optimizer, curiosity_optimizer, config, stats):
+    """Save all model weights + optimizer state + training stats."""
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
 
     checkpoint = {
@@ -80,16 +61,11 @@ def save_checkpoint(path: str, encoder, agents, composer,
     torch.save(checkpoint, path)
 
 
-def load_checkpoint(path: str, encoder, agents, composer,
-                    optimizer=None, curiosity_optimizer=None,
-                    device=None) -> Optional[Dict]:
-    """
-    Load model parameters from a checkpoint file.
-
-    Returns the stats dict from the checkpoint, or None if loading fails.
-    """
+def load_checkpoint(path, encoder, agents, composer,
+                    optimizer=None, curiosity_optimizer=None, device=None):
+    """Load model from checkpoint. Returns stats dict or None."""
     if not os.path.exists(path):
-        print(f"  ⚠️  Checkpoint not found: {path}")
+        print(f"  Warning: checkpoint not found: {path}")
         return None
 
     map_location = device if device else 'cpu'
@@ -108,10 +84,8 @@ def load_checkpoint(path: str, encoder, agents, composer,
     return checkpoint.get('stats', {})
 
 
-# ──────────────── Time Formatting ────────────────
-
-def format_time(seconds: float) -> str:
-    """Format seconds into human-readable string."""
+def format_time(seconds):
+    """Human-readable duration string."""
     if seconds < 60:
         return f"{seconds:.1f}s"
     elif seconds < 3600:
@@ -123,62 +97,37 @@ def format_time(seconds: float) -> str:
         return f"{h}h {m}m {s}s"
 
 
-# ──────────────── Cube Visualization ────────────────
-
-# ANSI color codes for cube face colors
+# ANSI colors for terminal cube rendering
 ANSI_COLORS = {
-    0: '\033[97m■\033[0m',   # White  (Up)
-    1: '\033[93m■\033[0m',   # Yellow (Down)
-    2: '\033[91m■\033[0m',   # Red    (Front)
-    3: '\033[38;5;208m■\033[0m',  # Orange (Back)
-    4: '\033[92m■\033[0m',   # Green  (Left)
-    5: '\033[94m■\033[0m',   # Blue   (Right)
+    0: '\033[97m■\033[0m',   # White
+    1: '\033[93m■\033[0m',   # Yellow
+    2: '\033[91m■\033[0m',   # Red
+    3: '\033[38;5;208m■\033[0m',  # Orange
+    4: '\033[92m■\033[0m',   # Green
+    5: '\033[94m■\033[0m',   # Blue
 }
 
 PLAIN_COLORS = {
-    0: 'W',   # White  (Up)
-    1: 'Y',   # Yellow (Down)
-    2: 'R',   # Red    (Front)
-    3: 'O',   # Orange (Back)
-    4: 'G',   # Green  (Left)
-    5: 'B',   # Blue   (Right)
+    0: 'W', 1: 'Y', 2: 'R', 3: 'O', 4: 'G', 5: 'B',
 }
 
 
-def visualize_cube_compact(faces: np.ndarray, use_color: bool = True) -> str:
-    """
-    Render cube faces as a compact cross-shaped net.
-
-    Layout:
-          U U U
-          U U U
-          U U U
-    L L L F F F R R R B B B
-    L L L F F F R R R B B B
-    L L L F F F R R R B B B
-          D D D
-          D D D
-          D D D
-
-    Args:
-        faces: (6, 3, 3) numpy array
-        use_color: use ANSI color codes (True) or plain letters (False)
-    """
+def visualize_cube_compact(faces, use_color=True):
+    """Render cube as a cross-shaped net (text)."""
     colors = ANSI_COLORS if use_color else PLAIN_COLORS
 
-    # U=0, D=1, F=2, B=3, L=4, R=5
     def c(face_idx, r, c_idx):
         return colors[int(faces[face_idx, r, c_idx])]
 
     lines = []
     pad = '         ' if not use_color else '            '
 
-    # Top face (U)
+    # U face
     for r in range(3):
         row = ' '.join(c(0, r, col) for col in range(3))
         lines.append(pad + row)
 
-    # Middle band: L F R B
+    # L F R B band
     for r in range(3):
         row = (
             ' '.join(c(4, r, col) for col in range(3)) + '  ' +
@@ -188,7 +137,7 @@ def visualize_cube_compact(faces: np.ndarray, use_color: bool = True) -> str:
         )
         lines.append(row)
 
-    # Bottom face (D)
+    # D face
     for r in range(3):
         row = ' '.join(c(1, r, col) for col in range(3))
         lines.append(pad + row)
@@ -196,19 +145,14 @@ def visualize_cube_compact(faces: np.ndarray, use_color: bool = True) -> str:
     return '\n'.join(lines)
 
 
-# ──────────────── Training History Logger ────────────────
-
 class TrainingLogger:
-    """
-    Logs training metrics to console and optionally to a JSON file.
-    """
+    """Logs training metrics, optionally to a JSON file."""
 
-    def __init__(self, log_file: Optional[str] = None):
+    def __init__(self, log_file=None):
         self.log_file = log_file
         self.entries = []
 
-    def log(self, iteration: int, metrics: Dict[str, Any]):
-        """Add a log entry."""
+    def log(self, iteration, metrics):
         entry = {
             'iteration': iteration,
             'timestamp': time.time(),
@@ -220,19 +164,15 @@ class TrainingLogger:
             self._write()
 
     def _write(self):
-        """Write all entries to JSON file."""
         os.makedirs(os.path.dirname(self.log_file) if os.path.dirname(self.log_file) else '.', exist_ok=True)
         with open(self.log_file, 'w') as f:
             json.dump(self.entries, f, indent=2, default=str)
 
-    def get_metric(self, key: str) -> List:
-        """Get a list of values for a specific metric across all entries."""
+    def get_metric(self, key):
         return [e.get(key) for e in self.entries if key in e]
 
 
-# ──────────────── Seed Utilities ────────────────
-
-def set_seed(seed: int):
+def set_seed(seed):
     """Set random seeds for reproducibility."""
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -240,44 +180,25 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-# ──────────────── Device Detection ────────────────
-
-def get_device(prefer_gpu: bool = True) -> torch.device:
-    """
-    Auto-detect best available device.
-    Prefers CUDA GPU, falls back to MPS (Apple Silicon), then CPU.
-    """
+def get_device(prefer_gpu=True):
+    """Auto-detect best device (CUDA > MPS > CPU)."""
     if prefer_gpu:
         if torch.cuda.is_available():
             device = torch.device('cuda')
-            print(f"  🖥  Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+            print(f"  Using CUDA: {torch.cuda.get_device_name(0)}")
             return device
         elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            device = torch.device('mps')
-            print(f"  🖥  Using Apple Silicon MPS")
-            return device
+            print(f"  Using Apple Silicon (MPS)")
+            return torch.device('mps')
 
-    device = torch.device('cpu')
-    print(f"  🖥  Using CPU")
-    return device
+    print(f"  Using CPU")
+    return torch.device('cpu')
 
 
-# ──────────────── Solve Rate Evaluator ────────────────
-
-def evaluate_solve_rate(trainer, scramble_depth: int,
-                        num_trials: int = 50,
-                        max_moves: int = 200) -> Dict[str, float]:
+def evaluate_solve_rate(trainer, scramble_depth, num_trials=50, max_moves=200):
     """
-    Evaluate the current model's solve rate on fresh scrambles.
-
-    Args:
-        trainer: MARVELSTrainer instance
-        scramble_depth: number of scramble moves
-        num_trials: number of solve attempts
-        max_moves: max moves per attempt
-
-    Returns:
-        dict with solve_rate, avg_moves (for solved), success_count
+    Run num_trials solve attempts at given scramble depth.
+    Returns dict with solve_rate, avg_moves, etc.
     """
     solved_count = 0
     total_moves = 0

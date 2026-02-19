@@ -1,155 +1,85 @@
-# MARVELS — Multi-Agent Residual Vision-Enhanced Learning for Symbolic Reasoning
+# MARVELS — Rubik's Cube Solver (No Search)
 
-> A novel reinforcement learning algorithm to solve the 3×3 Rubik's Cube **without any search algorithms** (no A*, MCTS, etc.) — pure policy learning with multi-agent coordination.
+RL-based approach to solving the 3x3 Rubik's Cube without any search algorithms (no MCTS, no A*, nothing). Just pure policy learning with multi-agent coordination.
 
-## ✨ Key Features
+MARVELS = Multi-Agent Residual Vision-Enhanced Learning for Symbolic Reasoning
 
-| Feature | Description |
-|---------|-------------|
-| **Multi-Agent Architecture** | 3 specialized agents (Corner, Edge, Center) each with PPO actor-critic networks |
-| **Skill Composer** | Attention-based dynamic policy blending — learns *when* to prioritize each agent |
-| **Quaternion Encoding** | Geometrically meaningful 270-dim state vector using cubie rotation quaternions |
-| **ICM Curiosity** | Intrinsic Curiosity Modules drive exploration in sparse-reward environments |
-| **Curriculum Learning** | Starts with 1-move scrambles, increases difficulty as the agent improves |
-| **Zero Search** | Pure policy inference at test time — no tree search, no backtracking |
+## What this does
 
-## 🏗 Architecture
+Instead of using a single giant network, we split the problem across three specialized agents:
+- **Corner Agent** — focuses on getting the 8 corners right
+- **Edge Agent** — handles the 12 edge pieces
+- **Center Agent** — deals with overall face orientation
 
-```
-Cube State (54 stickers)
-       ↓
-Quaternion Encoder → 270-dim state vector
-       ↓
-┌──────────┐ ┌──────────┐ ┌──────────┐
-│ Corner   │ │ Edge     │ │ Center   │
-│ Agent    │ │ Agent    │ │ Agent    │
-│ (PPO+ICM)│ │ (PPO+ICM)│ │ (PPO+ICM)│
-└────┬─────┘ └────┬─────┘ └────┬─────┘
-     ↓            ↓            ↓
-┌─────────────────────────────────────┐
-│         Skill Composer              │
-│  Attention-based policy blending    │
-│  w_corner + w_edge + w_center = 1   │
-└───────────────┬─────────────────────┘
-                ↓
-     Final Policy (18 actions)
-```
+Each agent has its own PPO actor-critic network plus an ICM curiosity module for exploration. A **Skill Composer** (attention-based) learns to blend their policies dynamically — kind of like how a human might focus on corners first, then edges, etc., except this is learned from scratch.
 
-## 📂 Project Structure
+The state representation uses quaternion encodings of cubie rotations instead of flat one-hot stickers, which gives the network a more geometric view of the cube (270-dim vector).
+
+## Project structure
 
 ```
-├── rubiks_env.py          # Complete 3×3 cube simulator (18 moves)
-├── quaternion_encoder.py  # Quaternion state encoding (270-dim)
-├── agents.py              # 3 Actor-Critic agents + ICM curiosity
-├── skill_composer.py      # Attention-based policy blending
-├── marvels_trainer.py     # Full PPO training loop with GAE
-├── main.py                # Entry point: train + solve demo
-├── utils.py               # Logging, saving, visualization
-├── requirements.txt       # Dependencies
-└── README.md              # This file
+rubiks_env.py          — Cube simulator, 18 moves (6 faces x 3 rotations)
+quaternion_encoder.py  — Quaternion-based state encoding
+agents.py              — The 3 actor-critic agents + curiosity modules
+skill_composer.py      — Attention-based policy blending
+marvels_trainer.py     — PPO training loop, GAE, curriculum learning
+main.py                — CLI entry point
+utils.py               — Checkpointing, logging, misc helpers
 ```
 
-## 🚀 Quick Start
+## Setup
 
-### Prerequisites
-
-- Python 3.10+
-- PyTorch 2.0+
-
-### Installation
+Python 3.10+, PyTorch 2.0+
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Training
+## Usage
 
 ```bash
-# Full training (default: 200 iterations)
+# train (default 200 iterations, starts with easy 1-move scrambles)
 python main.py
 
-# Quick smoke test (5 iterations)
+# quick test run
 python main.py --episodes 5
 
-# Train on GPU with custom settings
-python main.py --mode train --episodes 1000 --device cuda --num-envs 32
+# train on GPU
+python main.py --episodes 1000 --device cuda --num-envs 32
 
-# Resume from checkpoint
-python main.py --mode train --checkpoint checkpoints/best_model.pt
-```
+# resume from checkpoint
+python main.py --checkpoint checkpoints/best_model.pt
 
-### Solve Demo
-
-```bash
-# Solve a scrambled cube (loads best checkpoint)
+# try solving a scrambled cube
 python main.py --mode solve --scramble 15
 
-# Custom checkpoint
-python main.py --mode solve --checkpoint checkpoints/best_model.pt --scramble 10
-```
-
-### Evaluation
-
-```bash
-# Evaluate solve rate across difficulty levels
+# evaluate solve rate across difficulties
 python main.py --mode eval --trials 100 --scramble 25
 ```
 
-## ⚙️ Configuration
+## How training works
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--mode` | `train` | `train`, `solve`, or `eval` |
-| `--episodes` | `200` | Number of training iterations |
-| `--device` | `auto` | `auto`, `cpu`, `cuda`, or `mps` |
-| `--num-envs` | `16` | Parallel environments for rollouts |
-| `--lr` | `3e-4` | Learning rate |
-| `--scramble` | `15` | Scramble depth for solve/eval |
-| `--seed` | `42` | Random seed |
+1. Collect rollouts from 16 parallel envs
+2. Encode states with quaternion encoder (288 raw dims -> 270 projected)
+3. Each agent produces an 18-action policy
+4. Skill composer blends them with learned attention weights
+5. Rewards = external (+100 solve, -0.01/move) + 0.5 * curiosity
+6. GAE advantages (gamma=0.999, lambda=0.95)
+7. PPO update with clipping (eps=0.2), 4 epochs per batch
+8. Curriculum: bump scramble depth when solve rate > 50%
 
-## 🧠 Algorithm Details
+## Config
 
-### Reward System
+| Arg | Default | What it does |
+|-----|---------|-------------|
+| `--mode` | `train` | train / solve / eval |
+| `--episodes` | `200` | training iterations |
+| `--device` | `auto` | cpu / cuda / mps |
+| `--num-envs` | `16` | parallel envs |
+| `--lr` | `3e-4` | learning rate |
+| `--scramble` | `15` | scramble depth (solve/eval) |
+| `--seed` | `42` | random seed |
 
-```
-Total Reward = External + 0.5 × Intrinsic Curiosity
-
-External:
-  +100  if cube is solved
-  -0.01 per move (efficiency pressure)
-
-Intrinsic (per agent):
-  Forward model prediction error (ICM)
-```
-
-### Training Pipeline
-
-1. **Collect rollouts** from 16 parallel cube environments
-2. **Encode states** via quaternion encoder (288 → 270 dims)
-3. **Get agent policies** — each agent outputs 18-action probability distribution
-4. **Compose policies** — attention mechanism blends agent outputs
-5. **Compute rewards** — external + 0.5 × curiosity
-6. **GAE advantages** — γ=0.999, λ=0.95
-7. **PPO update** — clip=0.2, entropy=0.01, 4 epochs per batch
-8. **Curriculum** — increase scramble depth when solve rate > 50%
-
-### 18 Actions
-
-6 faces × 3 rotations = 18 actions:
-- **Faces**: U (Up), D (Down), F (Front), B (Back), L (Left), R (Right)
-- **Rotations**: CW (90°), 180°, CCW (270°)
-
-## 📊 Training Output
-
-The training loop prints progress in this format:
-
-```
-  Iter    10/200 │ Scramble:  1 │ Solve: 45.0% │ Reward:  +23.45 │ Moves:  12.3 │ ...
-  Iter    20/200 │ Scramble:  1 │ Solve: 78.0% │ Reward:  +67.89 │ Moves:   8.1 │ ...
-  📈 Curriculum advanced → scramble depth = 2
-  Iter    30/200 │ Scramble:  2 │ Solve: 32.0% │ Reward:  +15.67 │ Moves:  23.4 │ ...
-```
-
-## 📜 License
+## License
 
 MIT
